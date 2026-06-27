@@ -1,79 +1,128 @@
 /**
  * content.js
- * Injected into the active tab. Handles scrolling, fixed-element hiding,
- * lazy-load triggering, and coordinates with background.js during capture.
+ * Injected into the active tab. Handles page measurement, scrolling,
+ * fixed-element management, and lazy-load triggering.
+ *
+ * Critical design: sendResponse is ONLY called after two consecutive
+ * requestAnimationFrame calls, guaranteeing the browser compositor has
+ * fully painted the new scroll position before background.js captures.
  */
 
 (function () {
   'use strict';
 
-  // ─── Guard: prevent double-injection ─────────────────────────────────────
-  if (window.__fullSnapActive) {
-    console.warn('[FullSnap] Already active – ignoring re-injection.');
+  // ─── Re-injection guard ───────────────────────────────────────────────────
+  // If already injected, just signal ready — don't re-register listeners.
+  if (window.__fullSnapInjected) {
     return;
   }
-  window.__fullSnapActive = true;
+  window.__fullSnapInjected = true;
 
   // ─── State ────────────────────────────────────────────────────────────────
   const state = {
-    originalScrollX: window.scrollX,
-    originalScrollY: window.scrollY,
-    hiddenElements: [],   // elements temporarily hidden
-    originalStyles: [],   // { el, display } backup
+    originalScrollX : window.scrollX,
+    originalScrollY : window.scrollY,
+    hiddenElements  : [],
+    originalStyles  : [],
   };
 
-  // ─── Helpers ──────────────────────────────────────────────────────────────
+  // ─── Page measurement ─────────────────────────────────────────────────────
 
-  /**
-   * Returns the full scrollable height of the page.
-   * Uses the maximum across several reliable measurements.
-   */
   function getFullPageHeight() {
+    // Force layout flush so we get the real value
+    document.body.getBoundingClientRect();
     const body = document.body;
     const html = document.documentElement;
     return Math.max(
-      body.scrollHeight, body.offsetHeight, body.clientHeight,
+      body.scrollHeight, body.offsetHeight,
       html.scrollHeight, html.offsetHeight, html.clientHeight
     );
   }
 
-  /** Returns the viewport (visible area) height. */
-  function getViewportHeight() {
-    return window.innerHeight;
-  }
-
-  /** Returns the full page width. */
   function getFullPageWidth() {
     const body = document.body;
     const html = document.documentElement;
     return Math.max(
       body.scrollWidth, body.offsetWidth,
-      html.scrollWidth, html.offsetWidth,
-      html.clientWidth
+      html.scrollWidth, html.offsetWidth, html.clientWidth
     );
   }
 
+  function getViewportHeight() {
+    return window.innerHeight;
+  }
+
+  // ─── Guaranteed-paint scroll ──────────────────────────────────────────────
+
   /**
-   * Finds all fixed/sticky elements (headers, banners, cookie bars, etc.)
-   * and hides them so they don't appear multiple times across stitched shots.
+   * Scrolls to `y` and resolves only after the browser has composited TWO
+   * animation frames — meaning the pixel content on screen has actually
+   * changed. This is the key fix for "only captures the visible viewport".
+   *
+   * One rAF is NOT enough: the first fires at the start of the frame pipeline
+   * before paint. The second fires after the previous frame has been committed
+   * to the compositor, so we know the new scroll position is on screen.
+   *
+   * @param {number} y      Target scrollTop in CSS px
+   * @param {number} extra  Additional ms to wait after paint (for JS reflows)
    */
-  function hideFixedElements() {
-    const all = document.querySelectorAll('*');
-    all.forEach((el) => {
-      const style = window.getComputedStyle(el);
-      if (style.position === 'fixed' || style.position === 'sticky') {
-        state.hiddenElements.push(el);
-        state.originalStyles.push({
-          el,
-          visibility: el.style.visibility,
-          display: el.style.display,
+  function scrollAndWaitForPaint(y, extra = 120) {
+    return new Promise((resolve) => {
+      // Use scrollTo with instant so there's no animation to wait for
+      window.scrollTo({ top: y, left: 0, behavior: 'instant' });
+
+      // Wait for two paint frames + extra settle time
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          if (extra > 0) {
+            setTimeout(resolve, extra);
+          } else {
+            resolve();
+          }
         });
+      });
+    });
+  }
+
+  // ─── Lazy-load trigger ────────────────────────────────────────────────────
+
+  /**
+   * Scrolls the entire page top-to-bottom slowly to trigger IntersectionObserver
+   * callbacks and <img loading="lazy"> loads. Does NOT hide fixed elements.
+   */
+  async function triggerLazyLoad() {
+    const viewH = getViewportHeight();
+    let y = 0;
+
+    while (true) {
+      window.scrollTo({ top: y, left: 0, behavior: 'instant' });
+      // Single rAF + short delay is fine here — we don't capture during this phase
+      await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 80)));
+
+      const pageH = getFullPageHeight(); // re-measure — lazy load grows the page
+      if (y + viewH >= pageH) break;
+      y += viewH;
+    }
+
+    // Return to top
+    window.scrollTo({ top: 0, left: 0, behavior: 'instant' });
+    await new Promise((r) => setTimeout(r, 300));
+  }
+
+  // ─── Fixed/sticky element management ─────────────────────────────────────
+
+  function hideFixedElements() {
+    // Fresh scan every time (new elements may have appeared)
+    document.querySelectorAll('*').forEach((el) => {
+      const pos = window.getComputedStyle(el).position;
+      if (pos === 'fixed' || pos === 'sticky') {
+        state.hiddenElements.push(el);
+        state.originalStyles.push({ el, visibility: el.style.visibility });
         el.style.setProperty('visibility', 'hidden', 'important');
       }
     });
   }
 
-  /** Restores all previously hidden fixed/sticky elements. */
   function restoreFixedElements() {
     state.originalStyles.forEach(({ el, visibility }) => {
       el.style.visibility = visibility;
@@ -82,100 +131,72 @@
     state.originalStyles = [];
   }
 
-  /**
-   * Scrolls the page to a given Y position and waits for a frame + settle time.
-   * The extra delay allows lazy-loaded images and deferred content to render.
-   * @param {number} y - scroll top position in px
-   * @param {number} [delay=180] - ms to wait after scroll
-   */
-  function scrollToAndWait(y, delay = 180) {
-    return new Promise((resolve) => {
-      window.scrollTo({ top: y, left: 0, behavior: 'instant' });
-      // rAF ensures the browser has painted after scrolling
-      requestAnimationFrame(() => {
-        setTimeout(resolve, delay);
-      });
-    });
-  }
-
-  /**
-   * Pre-scrolls the page from top to bottom before the real capture begins.
-   * This triggers lazy-loaded images so they're available when we come back.
-   */
-  async function triggerLazyLoad() {
-    const pageHeight = getFullPageHeight();
-    const viewHeight = getViewportHeight();
-    let y = 0;
-    while (y < pageHeight) {
-      window.scrollTo({ top: y, left: 0, behavior: 'instant' });
-      await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 60)));
-      y += viewHeight;
-    }
-    // Scroll back to top before real capture
-    window.scrollTo({ top: 0, left: 0, behavior: 'instant' });
-    await new Promise((r) => setTimeout(r, 200));
-  }
-
-  /**
-   * Restores the page to its original scroll position and cleans up all state.
-   */
   function restorePageState() {
     restoreFixedElements();
     window.scrollTo({ top: state.originalScrollY, left: state.originalScrollX, behavior: 'instant' });
-    window.__fullSnapActive = false;
   }
 
-  // ─── Message Handler ──────────────────────────────────────────────────────
+  // ─── Message handler ──────────────────────────────────────────────────────
 
-  /**
-   * Listens for messages from background.js and responds with the data needed
-   * to orchestrate the full-page capture.
-   *
-   * Protocol:
-   *   { action: 'GET_PAGE_INFO' }          → page dimensions + scroll info
-   *   { action: 'PREPARE_CAPTURE' }        → hide fixed els, trigger lazy load
-   *   { action: 'SCROLL_TO', y: number }   → scroll to position, returns ack
-   *   { action: 'RESTORE_PAGE' }           → restore scroll + fixed elements
-   */
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     switch (message.action) {
 
+      // ── Dimensions ────────────────────────────────────────────────────────
       case 'GET_PAGE_INFO': {
         sendResponse({
-          pageHeight: getFullPageHeight(),
-          pageWidth: getFullPageWidth(),
-          viewportHeight: getViewportHeight(),
-          viewportWidth: window.innerWidth,
-          scrollY: window.scrollY,
+          pageHeight      : getFullPageHeight(),
+          pageWidth       : getFullPageWidth(),
+          viewportHeight  : getViewportHeight(),
+          viewportWidth   : window.innerWidth,
+          scrollY         : window.scrollY,
           devicePixelRatio: window.devicePixelRatio || 1,
         });
         break;
       }
 
-      case 'PREPARE_CAPTURE': {
-        // Must use async IIFE because addListener can't be async directly
+      // ── Phase 1: lazy-load scan (no hiding, no capture) ───────────────────
+      case 'TRIGGER_LAZY_LOAD': {
         (async () => {
           await triggerLazyLoad();
-          hideFixedElements();
-          // Scroll to very top for capture start
-          window.scrollTo({ top: 0, left: 0, behavior: 'instant' });
-          await new Promise((r) => setTimeout(r, 150));
-          sendResponse({ ready: true });
-        })();
-        return true; // keep message channel open for async sendResponse
-      }
-
-      case 'SCROLL_TO': {
-        (async () => {
-          await scrollToAndWait(message.y, message.delay || 180);
+          // Re-measure after lazy load — page may have grown
           sendResponse({
-            scrollY: window.scrollY,
-            pageHeight: getFullPageHeight(),
+            pageHeight    : getFullPageHeight(),
+            viewportHeight: getViewportHeight(),
           });
         })();
-        return true;
+        return true; // async
       }
 
+      // ── Phase 2: hide fixed elements after first frame is captured ────────
+      case 'HIDE_FIXED_ELEMENTS': {
+        hideFixedElements();
+        sendResponse({ hidden: state.hiddenElements.length });
+        break;
+      }
+
+      // ── Scroll to Y and confirm paint before responding ───────────────────
+      // background.js MUST NOT call captureVisibleTab until this resolves.
+      case 'SCROLL_TO': {
+        (async () => {
+          const targetY = message.y;
+          const extra   = message.extra ?? 120;
+
+          await scrollAndWaitForPaint(targetY, extra);
+
+          // Verify actual scroll position — the browser may clamp scrollY
+          // if targetY exceeds the real scrollable range.
+          const actualY = window.scrollY;
+
+          sendResponse({
+            scrollY    : actualY,
+            pageHeight : getFullPageHeight(),  // may have grown
+            atBottom   : (actualY + getViewportHeight()) >= getFullPageHeight() - 2,
+          });
+        })();
+        return true; // async
+      }
+
+      // ── Restore everything ────────────────────────────────────────────────
       case 'RESTORE_PAGE': {
         restorePageState();
         sendResponse({ restored: true });
@@ -186,9 +207,8 @@
         sendResponse({ error: `Unknown action: ${message.action}` });
     }
 
-    // Return true only when sendResponse is called asynchronously (handled above).
     return false;
   });
 
-  console.log('[FullSnap] Content script ready.');
+  console.log('[FullSnap] content.js ready, page height:', getFullPageHeight());
 })();
