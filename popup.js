@@ -7,22 +7,22 @@
 'use strict';
 
 // ─── DOM References ───────────────────────────────────────────────────────────
-const btnCapture = document.getElementById('btnCapture');
+const btnCapture      = document.getElementById('btnCapture');
 const progressSection = document.getElementById('progressSection');
-const progressLabel = document.getElementById('progressLabel');
+const progressLabel   = document.getElementById('progressLabel');
 const progressPercent = document.getElementById('progressPercent');
-const progressFill = document.getElementById('progressFill');
-const previewSection = document.getElementById('previewSection');
-const previewImg = document.getElementById('previewImg');
-const btnDownload = document.getElementById('btnDownload');
-const btnCopyImg = document.getElementById('btnCopyImg');
-const statusMsg = document.getElementById('statusMsg');
-const chkClipboard = document.getElementById('chkClipboard');
-const formatBtns = document.querySelectorAll('.format-btn');
+const progressFill    = document.getElementById('progressFill');
+const previewSection  = document.getElementById('previewSection');
+const previewImg      = document.getElementById('previewImg');
+const btnDownload     = document.getElementById('btnDownload');
+const btnCopyImg      = document.getElementById('btnCopyImg');
+const statusMsg       = document.getElementById('statusMsg');
+const chkClipboard    = document.getElementById('chkClipboard');
+const formatBtns      = document.querySelectorAll('.format-btn');
 
 // ─── State ────────────────────────────────────────────────────────────────────
 let selectedFormat = 'png';
-let lastDataUrl = null;
+let lastDataUrl    = null;
 
 // ─── Format Toggle ────────────────────────────────────────────────────────────
 
