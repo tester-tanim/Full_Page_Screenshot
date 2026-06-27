@@ -1,62 +1,73 @@
 /**
  * background.js
- * Service worker for FullSnap extension.
- * Coordinates the full-page screenshot process:
- *   1. Injects content.js into the active tab
- *   2. Queries page dimensions from content.js
- *   3. Scrolls section by section, capturing each viewport via captureVisibleTab
- *   4. Stitches all images into one tall canvas using OffscreenCanvas
- *   5. Downloads the result as PNG or JPEG
+ * Service worker — orchestrates full-page capture.
+ *
+ * Capture loop contract:
+ *   1. Send SCROLL_TO to content.js
+ *   2. content.js scrolls, waits for TWO paint frames, then responds
+ *   3. ONLY THEN do we call captureVisibleTab
+ *   4. Rate-limit captureVisibleTab to ≤ 1.8/sec (Chrome quota is 2/sec)
+ *
+ * This guarantees what Chrome captures actually matches the scroll position.
  */
 
 'use strict';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-const SCROLL_DELAY_MS = 200;      // wait after scroll before capture (ms)
-const LAZY_LOAD_DELAY_MS = 300;   // extra delay for lazy-loaded content (ms)
+// Extra ms content.js waits after the double-rAF before responding.
+// Increase if you see partially-rendered content (e.g. on React/Vue heavy pages).
+const SCROLL_SETTLE_MS   = 150;
+const FIRST_SCROLL_EXTRA = 300;  // more time for the very first scroll (cold render)
+const MIN_CAPTURE_GAP_MS = 560;  // stay safely under Chrome's 2 captures/sec hard limit
+
+// ─── Sleep helper ─────────────────────────────────────────────────────────────
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// ─── Rate-limited captureVisibleTab ───────────────────────────────────────────
+
+let _lastCaptureAt = 0;
+
+/**
+ * Calls captureVisibleTab but enforces a minimum gap between calls so we
+ * never exceed Chrome's MAX_CAPTURE_VISIBLE_TAB_CALLS_PER_SECOND quota.
+ */
+async function captureTab(opts) {
+  const wait = MIN_CAPTURE_GAP_MS - (Date.now() - _lastCaptureAt);
+  if (wait > 0) await sleep(wait);
+  _lastCaptureAt = Date.now();
+  return chrome.tabs.captureVisibleTab(null, opts);
+}
 
 // ─── State ────────────────────────────────────────────────────────────────────
 
-/** Tracks tabs where a capture is already in progress (prevents double-capture). */
 const capturingTabs = new Set();
 
-// ─── Entry Points ─────────────────────────────────────────────────────────────
+// ─── Entry points ─────────────────────────────────────────────────────────────
 
-/**
- * Keyboard shortcut handler.
- * Triggered by Ctrl+Shift+S / Cmd+Shift+S as defined in manifest.json.
- */
-chrome.commands.onCommand.addListener(async (command) => {
-  if (command === 'trigger-screenshot') {
+chrome.commands.onCommand.addListener(async (cmd) => {
+  if (cmd === 'trigger-screenshot') {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (tab) await startCapture(tab.id, { format: 'png' });
+    if (tab) startCapture(tab.id, { format: 'png' });
   }
 });
 
-/**
- * Message listener.
- * popup.js sends { action: 'START_CAPTURE', options: { format, clipboard } }
- */
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (message.action === 'START_CAPTURE') {
+chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  if (msg.action === 'START_CAPTURE') {
     (async () => {
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-      if (!tab) {
-        sendResponse({ error: 'No active tab found.' });
-        return;
-      }
+      if (!tab) { sendResponse({ error: 'No active tab.' }); return; }
       try {
-        await startCapture(tab.id, message.options || {});
+        await startCapture(tab.id, msg.options || {});
         sendResponse({ success: true });
-      } catch (err) {
-        sendResponse({ error: err.message });
+      } catch (e) {
+        sendResponse({ error: e.message });
       }
     })();
-    return true; // async sendResponse
+    return true;
   }
-
-  if (message.action === 'GET_CAPTURE_STATUS') {
+  if (msg.action === 'GET_CAPTURE_STATUS') {
     (async () => {
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
       sendResponse({ capturing: tab ? capturingTabs.has(tab.id) : false });
@@ -65,292 +76,168 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 });
 
-// ─── Core Capture Logic ───────────────────────────────────────────────────────
+// ─── Core capture ─────────────────────────────────────────────────────────────
 
-/**
- * Orchestrates the full-page screenshot for a given tab.
- * @param {number} tabId
- * @param {{ format?: 'png'|'jpeg', quality?: number }} options
- */
 async function startCapture(tabId, options = {}) {
   if (capturingTabs.has(tabId)) {
-    console.warn('[FullSnap] Capture already in progress for tab', tabId);
+    console.warn('[FullSnap] Already capturing tab', tabId);
     return;
   }
-
   capturingTabs.add(tabId);
-  broadcastProgress(tabId, 0, 'Preparing…');
+  progress(tabId, 0, 'Injecting…');
+
+  const fmt = { format: options.format === 'jpeg' ? 'jpeg' : 'png', quality: options.quality || 92 };
 
   try {
-    // ── Step 1: Inject content script ────────────────────────────────────────
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      files: ['content.js'],
-    });
+    // ── 1. Inject content script (idempotent — guard inside content.js) ──────
+    await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] });
+    // Small pause to let the content script initialise its message listener
+    await sleep(100);
 
-    // ── Step 2: Get page dimensions ───────────────────────────────────────────
-    const pageInfo = await sendToContent(tabId, { action: 'GET_PAGE_INFO' });
-    const {
-      pageHeight,
-      viewportHeight,
-      viewportWidth,
-      devicePixelRatio,
-    } = pageInfo;
+    // ── 2. Initial page info ──────────────────────────────────────────────────
+    const info = await msg(tabId, { action: 'GET_PAGE_INFO' });
+    let { viewportHeight, viewportWidth, devicePixelRatio } = info;
+    progress(tabId, 5, 'Triggering lazy load…');
 
-    broadcastProgress(tabId, 5, 'Scanning page…');
+    // ── 3. Lazy-load scan — content.js scrolls the whole page once ────────────
+    const afterLazy = await msg(tabId, { action: 'TRIGGER_LAZY_LOAD' });
+    // Use the post-lazy-load page height — it may be larger
+    let pageHeight = afterLazy.pageHeight;
+    viewportHeight = afterLazy.viewportHeight || viewportHeight;
+    progress(tabId, 10, 'Starting capture…');
 
-    // ── Step 3: Prepare – lazy-load trigger + hide fixed elements ─────────────
-    await sendToContent(tabId, { action: 'PREPARE_CAPTURE' });
-    broadcastProgress(tabId, 10, 'Starting capture…');
-
-    // ── Step 4: Determine scroll steps ───────────────────────────────────────
-    // We scroll by `viewportHeight` each step.
-    // The last step may be a partial scroll — we handle cropping later.
-    const totalSteps = Math.ceil(pageHeight / viewportHeight);
     const screenshots = [];
 
-    for (let step = 0; step < totalSteps; step++) {
-      const scrollY = step * viewportHeight;
+    // ── 4. Scroll to top, capture FIRST frame with navbar visible ─────────────
+    await msg(tabId, { action: 'SCROLL_TO', y: 0, extra: FIRST_SCROLL_EXTRA });
+    const firstShot = await captureTab(fmt);
+    screenshots.push({ dataUrl: firstShot, scrollY: 0 });
+    progress(tabId, 14, 'Captured header…');
 
-      // Scroll content script to the target position
-      const scrollResult = await sendToContent(tabId, {
-        action: 'SCROLL_TO',
-        y: scrollY,
-        delay: step === 0 ? LAZY_LOAD_DELAY_MS : SCROLL_DELAY_MS,
-      });
+    // ── 5. Hide fixed/sticky elements for all subsequent frames ───────────────
+    await msg(tabId, { action: 'HIDE_FIXED_ELEMENTS' });
 
-      // Actual scrollY may differ if page isn't tall enough
-      const actualScrollY = scrollResult.scrollY;
+    // ── 6. Scroll & capture loop ──────────────────────────────────────────────
+    // We step by viewportHeight but always use the ACTUAL scrollY returned by
+    // content.js (the browser may clamp when near the bottom). We stop when
+    // content.js says atBottom = true.
+    let step = 1;
+    let targetY = viewportHeight;
 
-      // Capture the visible viewport
-      const dataUrl = await captureVisibleTabWithRetry({
-        format: options.format === 'jpeg' ? 'jpeg' : 'png',
-        quality: options.quality || 92,
-      });
+    while (true) {
+      const scrolled = await msg(tabId, { action: 'SCROLL_TO', y: targetY, extra: SCROLL_SETTLE_MS });
+      const actualY  = scrolled.scrollY;
 
-      screenshots.push({
-        dataUrl,
-        scrollY: actualScrollY,
-        stepIndex: step,
-      });
+      // Safety: if actualY is the same as the previous screenshot's scrollY
+      // (browser clamped), skip to avoid a duplicate frame at the same position.
+      const lastY = screenshots[screenshots.length - 1].scrollY;
+      if (actualY <= lastY) break;
 
-      const progress = 10 + Math.round((step / totalSteps) * 75);
-      broadcastProgress(tabId, progress, `Capturing… (${step + 1}/${totalSteps})`);
+      const shot = await captureTab(fmt);
+      screenshots.push({ dataUrl: shot, scrollY: actualY });
+
+      // Re-read page height — lazy load may have expanded it during scroll
+      pageHeight = scrolled.pageHeight;
+
+      const pct = 14 + Math.round((step / Math.ceil(pageHeight / viewportHeight)) * 72);
+      progress(tabId, Math.min(pct, 86), `Capturing… (frame ${step + 1})`);
+
+      if (scrolled.atBottom) break;
+
+      step++;
+      targetY = actualY + viewportHeight;
     }
 
-    // ── Step 5: Restore page state ────────────────────────────────────────────
-    await sendToContent(tabId, { action: 'RESTORE_PAGE' });
-    broadcastProgress(tabId, 86, 'Stitching image…');
+    // ── 7. Restore page state ─────────────────────────────────────────────────
+    await msg(tabId, { action: 'RESTORE_PAGE' });
+    progress(tabId, 87, 'Stitching…');
 
-    // ── Step 6: Stitch screenshots into one image ─────────────────────────────
-    const finalImageDataUrl = await stitchScreenshots(
-      screenshots,
-      pageHeight,
-      viewportHeight,
-      viewportWidth,
-      devicePixelRatio,
-      options
-    );
+    // ── 8. Stitch ─────────────────────────────────────────────────────────────
+    const finalUrl = await stitch(screenshots, viewportWidth, devicePixelRatio, options);
+    progress(tabId, 96, 'Saving…');
 
-    broadcastProgress(tabId, 95, 'Saving file…');
+    // ── 9. Download ───────────────────────────────────────────────────────────
+    const ext = options.format === 'jpeg' ? 'jpeg' : 'png';
+    await chrome.downloads.download({ url: finalUrl, filename: filename(ext), saveAs: false });
+    progress(tabId, 100, 'Done!');
 
-    // ── Step 7: Download ──────────────────────────────────────────────────────
-    const format = options.format === 'jpeg' ? 'jpeg' : 'png';
-    const filename = generateFilename(format);
-
-    await chrome.downloads.download({
-      url: finalImageDataUrl,
-      filename,
-      saveAs: false,
-    });
-
-    broadcastProgress(tabId, 100, 'Done!');
-
-    // If clipboard copy was requested, signal popup (popup will handle it via canvas)
     if (options.clipboard) {
-      broadcastToPopup(tabId, { action: 'COPY_TO_CLIPBOARD', dataUrl: finalImageDataUrl });
+      chrome.runtime.sendMessage({ action: 'COPY_TO_CLIPBOARD', dataUrl: finalUrl, tabId })
+        .catch(() => {});
     }
 
   } catch (err) {
-    console.error('[FullSnap] Capture failed:', err);
-    broadcastProgress(tabId, -1, `Error: ${err.message}`);
-    // Attempt to restore page state even on failure
-    try {
-      await sendToContent(tabId, { action: 'RESTORE_PAGE' });
-    } catch (_) { /* ignore */ }
+    console.error('[FullSnap]', err);
+    progress(tabId, -1, `Error: ${err.message}`);
+    try { await msg(tabId, { action: 'RESTORE_PAGE' }); } catch (_) {}
   } finally {
     capturingTabs.delete(tabId);
   }
 }
 
+// ─── Stitching ────────────────────────────────────────────────────────────────
 
 /**
- * Waits for the given number of milliseconds.
- * @param {number} ms
+ * Decodes all captured frames and draws them onto an OffscreenCanvas at their
+ * exact scrollY positions. No height cap — canvas grows to fit everything.
  */
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
+async function stitch(screenshots, viewportW, dpr, options) {
+  const physW = Math.round(viewportW * dpr);
 
-/**
- * Captures the visible tab, retrying when Chrome temporarily rate limits us.
- * @param {{ format: string, quality?: number }} options
- */
-async function captureVisibleTabWithRetry(options) {
-  let delayMs = 250;
+  // Decode all images in parallel
+  const frames = await Promise.all(
+    screenshots.map(async ({ dataUrl, scrollY }) => {
+      const blob   = await (await fetch(dataUrl)).blob();
+      const bitmap = await createImageBitmap(blob);
+      return { bitmap, scrollY };
+    })
+  );
 
-  for (;;) {
-    try {
-      return await chrome.tabs.captureVisibleTab(null, options);
-    } catch (err) {
-      if (!isCaptureQuotaError(err)) {
-        throw err;
-      }
+  // Canvas height = bottom pixel of the last frame
+  const last   = frames[frames.length - 1];
+  const totalH = Math.round(last.scrollY * dpr) + last.bitmap.height;
 
-      await sleep(delayMs);
-      delayMs = Math.min(delayMs * 2, 2000);
-    }
-  }
-}
+  const canvas = new OffscreenCanvas(physW, totalH);
+  const ctx    = canvas.getContext('2d');
 
-/**
- * Detects Chrome's captureVisibleTab quota error.
- * @param {unknown} err
- * @returns {boolean}
- */
-function isCaptureQuotaError(err) {
-  const message = err && typeof err === 'object' && 'message' in err
-    ? String(err.message)
-    : String(err);
-  return message.includes('MAX_CAPTURE_VISIBLE_TAB_CALLS_PER_SECOND');
-}
-
-// ─── Image Stitching ──────────────────────────────────────────────────────────
-
-/**
- * Stitches multiple viewport screenshots into one full-page image using
- * OffscreenCanvas (available in service workers since Chrome 109).
- *
- * @param {Array<{dataUrl: string, scrollY: number, stepIndex: number}>} screenshots
- * @param {number} pageHeight   - total page height in CSS px
- * @param {number} viewportH    - viewport height in CSS px
- * @param {number} viewportW    - viewport width in CSS px
- * @param {number} dpr          - device pixel ratio
- * @param {{format?: string, quality?: number}} options
- * @returns {Promise<string>} data URL of stitched image
- */
-async function stitchScreenshots(screenshots, pageHeight, viewportH, viewportW, dpr, options) {
-  // Physical pixels (accounting for retina/HiDPI displays)
-  const physViewportH = Math.round(viewportH * dpr);
-  const physViewportW = Math.round(viewportW * dpr);
-  const physPageHeight = Math.round(pageHeight * dpr);
-
-  // Create an OffscreenCanvas sized to the full page
-  const canvas = new OffscreenCanvas(physViewportW, physPageHeight);
-  const ctx = canvas.getContext('2d');
-
-  for (let i = 0; i < screenshots.length; i++) {
-    const { dataUrl, scrollY } = screenshots[i];
-
-    // Decode the image from data URL
-    const response = await fetch(dataUrl);
-    const blob = await response.blob();
-    const imageBitmap = await createImageBitmap(blob);
-
-    // Physical Y offset where this slice should be drawn on the canvas
+  for (const { bitmap, scrollY } of frames) {
     const destY = Math.round(scrollY * dpr);
-
-    // Height of the source region to copy.
-    // For all but the last step this is a full viewport height.
-    // For the last step we only want the pixels that fall within the page.
-    const remainingHeight = physPageHeight - destY;
-    const srcHeight = Math.min(physViewportH, remainingHeight);
-
-    if (srcHeight <= 0) continue;
-
-    // Draw only the needed portion of the captured image
-    ctx.drawImage(
-      imageBitmap,
-      0, 0, physViewportW, srcHeight,   // source rect
-      0, destY, physViewportW, srcHeight // destination rect
-    );
-
-    imageBitmap.close();
+    ctx.drawImage(bitmap, 0, 0, bitmap.width, bitmap.height, 0, destY, bitmap.width, bitmap.height);
+    bitmap.close();
   }
 
-  // Convert canvas to blob → object URL
-  const mimeType = options.format === 'jpeg' ? 'image/jpeg' : 'image/png';
-  const quality = options.format === 'jpeg' ? (options.quality || 92) / 100 : undefined;
-  const finalBlob = await canvas.convertToBlob({ type: mimeType, quality });
-
-  return blobToDataUrl(finalBlob);
+  const mime  = options.format === 'jpeg' ? 'image/jpeg' : 'image/png';
+  const qual  = options.format === 'jpeg' ? (options.quality || 92) / 100 : undefined;
+  const blob  = await canvas.convertToBlob({ type: mime, quality: qual });
+  return dataUrl(blob);
 }
 
-/**
- * Converts a Blob to a base64 data URL using FileReader.
- * @param {Blob} blob
- * @returns {Promise<string>}
- */
-function blobToDataUrl(blob) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result);
-    reader.onerror = () => reject(new Error('Failed to read blob'));
-    reader.readAsDataURL(blob);
+function dataUrl(blob) {
+  return new Promise((res, rej) => {
+    const r = new FileReader();
+    r.onload  = () => res(r.result);
+    r.onerror = () => rej(new Error('FileReader failed'));
+    r.readAsDataURL(blob);
   });
 }
 
-// ─── Messaging Helpers ────────────────────────────────────────────────────────
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
-/**
- * Sends a message to content.js in the specified tab and returns the response.
- * @param {number} tabId
- * @param {object} message
- * @returns {Promise<object>}
- */
-function sendToContent(tabId, message) {
+function msg(tabId, message) {
   return new Promise((resolve, reject) => {
     chrome.tabs.sendMessage(tabId, message, (response) => {
-      if (chrome.runtime.lastError) {
-        reject(new Error(chrome.runtime.lastError.message));
-      } else {
-        resolve(response);
-      }
+      if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+      else resolve(response);
     });
   });
 }
 
-/**
- * Broadcasts progress updates to the popup (if open).
- * @param {number} tabId
- * @param {number} percent  0–100, or -1 for error
- * @param {string} label    Human-readable status
- */
-function broadcastProgress(tabId, percent, label) {
-  // Store in extension storage so popup can read it even if it was just opened
+function progress(tabId, percent, label) {
   chrome.storage.session.set({ [`progress_${tabId}`]: { percent, label, ts: Date.now() } });
-
-  // Also try sending directly to popup (may not be open)
-  chrome.runtime.sendMessage({ action: 'PROGRESS_UPDATE', tabId, percent, label })
-    .catch(() => { /* popup not open – that's fine */ });
+  chrome.runtime.sendMessage({ action: 'PROGRESS_UPDATE', tabId, percent, label }).catch(() => {});
 }
 
-/**
- * Sends a message directly to the popup.
- */
-function broadcastToPopup(tabId, payload) {
-  chrome.runtime.sendMessage({ ...payload, tabId })
-    .catch(() => { /* popup not open */ });
-}
-
-// ─── Filename Utility ─────────────────────────────────────────────────────────
-
-/**
- * Generates a timestamp-based filename for the download.
- * @param {string} ext  'png' or 'jpeg'
- */
-function generateFilename(ext) {
-  const now = new Date();
-  const pad = (n) => String(n).padStart(2, '0');
-  return `fullsnap-${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}.${ext}`;
+function filename(ext) {
+  const n = new Date(), p = (v) => String(v).padStart(2, '0');
+  return `fullsnap-${n.getFullYear()}-${p(n.getMonth()+1)}-${p(n.getDate())}-${p(n.getHours())}${p(n.getMinutes())}${p(n.getSeconds())}.${ext}`;
 }
